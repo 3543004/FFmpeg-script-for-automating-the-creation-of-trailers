@@ -2,7 +2,7 @@
 
 一个基于 **PowerShell & Batch 混合封装** 的 Windows 自动化 HLS (HTTP Live Streaming) 音视频转码与加密切片工具。
 
-脚本遵循 **Apple HLS Version 6** 规范，具备动态 GOP 锁定、绝对 6 秒等长切片、AES-128 随机密钥加密、多码率自适应、多音轨/多字幕解耦与语言智能识别等高级特性。
+脚本遵循 **Apple HLS Version 6** 规范，自动识别 MP4 / MKV 格式视频文件、具备动态 GOP 锁定、绝对 6 秒等长切片、AES-128 随机密钥加密、多码率自适应、多音轨/多字幕解耦与语言智能识别等高级特性。
 
 ---
 
