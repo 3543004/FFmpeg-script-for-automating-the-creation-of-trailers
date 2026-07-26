@@ -1,8 +1,11 @@
 ﻿<# :
 @cls
 @echo off
+pushd "%~dp0"
 chcp 65001 >nul
-powershell -NoProfile -ExecutionPolicy Bypass -Command "iex ([System.IO.File]::ReadAllText('%~f0', [System.Text.Encoding]::UTF8))"
+set "SCRIPT_FULL_PATH=%~f0"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "iex ([System.IO.File]::ReadAllText($env:SCRIPT_FULL_PATH, [System.Text.Encoding]::UTF8))"
+popd
 exit /b %ERRORLEVEL%
 #>
 
@@ -11,14 +14,18 @@ exit /b %ERRORLEVEL%
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# 全局清理辅助函数（报错或中途取消时自动清理垃圾文件）
+# 全局清理辅助函数
 # ------------------------------------------------------------------------------
 function Invoke-CleanupAndExit($dirPath, $message) {
     Write-Host ("`n🧹 [清理机制] " + $message) -ForegroundColor Red
-    if (Test-Path $dirPath) {
+    if ([System.IO.Directory]::Exists($dirPath)) {
         Write-Host "正在清理残留的输出文件夹与密钥文件..." -ForegroundColor Yellow
         Pop-Location -ErrorAction SilentlyContinue
-        Remove-Item -Path $dirPath -Recurse -Force -ErrorAction SilentlyContinue
+        try {
+            [System.IO.Directory]::Delete($dirPath, $true)
+        } catch {
+            Remove-Item -LiteralPath $dirPath -Recurse -Force -ErrorAction SilentlyContinue
+        }
         Write-Host "✅ 清理完成！所有临时文件已安全擦除。" -ForegroundColor Green
     }
     Read-Host "`n👉 按 Enter 键退出脚本"
@@ -26,25 +33,21 @@ function Invoke-CleanupAndExit($dirPath, $message) {
 }
 
 # ------------------------------------------------------------------------------
-# 智能语言识别函数 (支持中/英文拓宽匹配，防误判)
+# 智能语言识别函数
 # ------------------------------------------------------------------------------
 function Parse-TrackLanguage {
     param (
-        [string]$MetaLang,   # ffprobe 读出的 language 标签
-        [string]$MetaTitle,  # ffprobe 读出的 title 标签
-        [string]$FileName    # 文件名（外置文件/内置轨提取）
+        [string]$MetaLang,   
+        [string]$MetaTitle,  
+        [string]$FileName    
     )
     
     $targetText = "$MetaLang $MetaTitle $FileName".ToLower()
 
-    # 正则边界：前后可以是 点(.)、下划线(_)、中划线(-)、空格、括号等
     $bStart = "(?:^|[\._\-\s\[\(\]])"
     $bEnd   = "(?:$|[\._\-\s\]\)\.])"
 
-    # 1. 中文匹配模式 (拓宽)
     $zhPattern = "${bStart}(chi|zho|zh|cn|chs|cht|sc|tc|chinese|mandarin|zh-cn|zh-tw|zh-hk|zh-hans|zh-hant|中文|简体|繁體|国语|普通话)${bEnd}"
-    
-    # 2. 英文匹配模式 (拓宽)
     $enPattern = "${bStart}(eng|en|english|en-us|en-gb)${bEnd}"
 
     if ($targetText -match $zhPattern) {
@@ -59,18 +62,53 @@ function Parse-TrackLanguage {
 }
 
 # ------------------------------------------------------------------------------
-# 第一步：自动识别当前目录下的视频文件 (.mp4 / .mkv)
+# 第一步：自动定位脚本物理目录，并识别视频文件 (.mp4 / .mkv)
 # ------------------------------------------------------------------------------
-$videoFiles = Get-ChildItem -Path $PWD -File | Where-Object { $_.Extension -in '.mp4', '.mkv' }
+$scriptFilePath = $null
+
+if ($env:SCRIPT_FULL_PATH -and (Test-Path -LiteralPath $env:SCRIPT_FULL_PATH)) {
+    $scriptFilePath = $env:SCRIPT_FULL_PATH
+} elseif ($MyInvocation.MyCommand.Path -and (Test-Path -LiteralPath $MyInvocation.MyCommand.Path)) {
+    $scriptFilePath = $MyInvocation.MyCommand.Path
+} elseif ($PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath)) {
+    $scriptFilePath = $PSCommandPath
+}
+
+if ($scriptFilePath) {
+    $realScriptDir = Split-Path -Parent $scriptFilePath
+    Set-Location -LiteralPath $realScriptDir
+    $currentPath = $realScriptDir
+} else {
+    $currentPath = $PWD.ProviderPath
+}
+
+$allCandidates = Get-ChildItem -LiteralPath $currentPath -Force | Where-Object { -not $_.PSIsContainer }
+
+$videoFiles = @($allCandidates | Where-Object { 
+    $_.Extension -match '^\.(mp4|mkv)$' -or $_.Name -match '\.(mp4|mkv)$'
+})
 
 if ($videoFiles.Count -eq 0) {
-    Write-Host "❌ [错误] 当前目录下没有找到任何 .mp4 或 .mkv 视频文件！" -ForegroundColor Red
+    Write-Host "❌ [错误] 扫描完成，但在当前目录下未找到任何 .mp4 或 .mkv 视频文件！" -ForegroundColor Red
+    Write-Host ("📂 脚本定位到的物理路径为: [" + $currentPath + "]") -ForegroundColor Yellow
+
+    if ($allCandidates.Count -eq 0) {
+        Write-Host "`n⚠️ [现场诊断] 该目录下没有任何文件。" -ForegroundColor Red
+    } else {
+        Write-Host "`n🔍 [现场诊断] 当前目录下检测到的文件列表如下：" -ForegroundColor Cyan
+        foreach ($f in $allCandidates) {
+            Write-Host ("  📄 文件名: {0}  |  后缀: [{1}]  |  属性: {2}" -f $f.Name, $f.Extension, $f.Attributes) -ForegroundColor Gray
+        }
+    }
+
     Read-Host "`n👉 按 Enter 键退出脚本"
     exit
 } elseif ($videoFiles.Count -eq 1) {
     $selectedFile = $videoFiles[0]
-    Write-Host ("✅ 自动识别到唯一目标视频: " + $selectedFile.Name) -ForegroundColor Green
+    Write-Host ("✅ 自动锁定工作目录: [" + $currentPath + "]") -ForegroundColor Cyan
+    Write-Host ("✅ 成功识别到目标视频: " + $selectedFile.Name) -ForegroundColor Green
 } else {
+    Write-Host ("✅ 自动锁定工作目录: [" + $currentPath + "]") -ForegroundColor Cyan
     $selectedFile = $null
     while ($null -eq $selectedFile) {
         Write-Host "`n🔍 识别到当前目录下有多个视频文件，请选择要处理的文件:" -ForegroundColor Yellow
@@ -91,7 +129,7 @@ if ($videoFiles.Count -eq 0) {
 
 $inputFileFull = $selectedFile.FullName
 $folderName = $selectedFile.BaseName
-$outputDir = Join-Path $PWD $folderName
+$outputDir = Join-Path $currentPath $folderName
 
 # ------------------------------------------------------------------------------
 # 第二步：选择转码模式
@@ -127,8 +165,17 @@ $probeData = $probeJsonRaw | ConvertFrom-Json
 $embeddedAudio = @($probeData.streams | Where-Object { $_.codec_type -eq 'audio' })
 $embeddedSubs  = @($probeData.streams | Where-Object { $_.codec_type -eq 'subtitle' -and $_.codec_name -notmatch 'pgs|dvd|sup' })
 
-# 2. 动态获取视频 FPS 并精确计算 6 秒 GOP 帧数
-$videoStream = $probeData.streams | Where-Object { $_.codec_type -eq 'video' } | Select-Object -First 1
+# 2. 动态获取主视频 FPS (排除 MKV 嵌入的封面图片/图片流 attached_pic)
+$videoStream = $probeData.streams | Where-Object { 
+    $_.codec_type -eq 'video' -and $_.disposition.attached_pic -ne 1 
+} | Select-Object -First 1
+
+if ($null -eq $videoStream) {
+    Write-Host "❌ [错误] 无法定位主视频轨！" -ForegroundColor Red
+    Read-Host "`n👉 按 Enter 键退出脚本"
+    exit
+}
+
 $rawFps = $videoStream.r_frame_rate
 
 if ($rawFps -match "(\d+)/(\d+)") {
@@ -141,11 +188,11 @@ $gop = [math]::Round($fps * 6)
 Write-Host ("🎬 [帧率检测] 原视频帧率: {0:F2} fps -> 锁定 6 秒精确 GOP: {1} 帧" -f $fps, $gop) -ForegroundColor Green
 
 # 3. 扫描外置音字幕
-$extAudioFiles = Get-ChildItem -Path $PWD -File | Where-Object { 
-    $_.BaseName -like "$folderName*" -and $_.Extension -in '.mp3', '.aac', '.m4a' -and $_.FullName -ne $inputFileFull 
+$extAudioFiles = Get-ChildItem -LiteralPath $currentPath -Force | Where-Object { 
+    -not $_.PSIsContainer -and $_.BaseName -like "$folderName*" -and ($_.Extension -match '^\.(mp3|aac|m4a)$') -and $_.FullName -ne $inputFileFull 
 }
-$extSubFiles   = Get-ChildItem -Path $PWD -File | Where-Object { 
-    $_.BaseName -like "$folderName*" -and $_.Extension -in '.srt', '.vtt' 
+$extSubFiles   = Get-ChildItem -LiteralPath $currentPath -Force | Where-Object { 
+    -not $_.PSIsContainer -and $_.BaseName -like "$folderName*" -and ($_.Extension -match '^\.(srt|vtt)$') 
 }
 
 $totalAudioCount = $embeddedAudio.Count + $extAudioFiles.Count
@@ -171,33 +218,37 @@ if ($hasNvenc) {
 # 第四步：初始化输出文件夹与密钥（随机 Key + 随机 IV 写入 key.info）
 # ------------------------------------------------------------------------------
 Write-Host ("`n📁 创建输出文件夹: [" + $folderName + "]...") -ForegroundColor Yellow
-if (-not (Test-Path $outputDir)) { New-Item -ItemType Directory -Path $outputDir | Out-Null }
 
-Push-Location $outputDir
+# 【核心修正】全面改用 .NET 原生 API [System.IO.Directory]::CreateDirectory 彻底消除 PowerShell 版本差异与中括号问题
+[System.IO.Directory]::CreateDirectory($outputDir) | Out-Null
+
+Set-Location -LiteralPath $outputDir
 
 $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
 
-# 生成 16 字节随机密钥
 $keyBytes = [byte[]]::new(16)
 $rng.GetBytes($keyBytes)
-[System.IO.File]::WriteAllBytes("$outputDir\enc.key", $keyBytes)
+[System.IO.File]::WriteAllBytes((Join-Path $outputDir "enc.key"), $keyBytes)
 
-# 生成 16 字节随机 IV (转成 32 位大写十六进制字符串)
 $ivBytes = [byte[]]::new(16)
 $rng.GetBytes($ivBytes)
 $ivHex = ($ivBytes | ForEach-Object { $_.ToString("X2") }) -join ""
 
-# 写入 key.info (第1行: m3u8中的URI, 第2行: ffmpeg读取的本地路径, 第3行: 随机IV)
 $keyInfoContent = "../enc.key`nenc.key`n$ivHex"
-[System.IO.File]::WriteAllText("$outputDir\key.info", $keyInfoContent)
+[System.IO.File]::WriteAllText((Join-Path $outputDir "key.info"), $keyInfoContent)
 
-# 动态预建子文件夹
 $resCountMap = @{ "1"=1; "2"=3; "3"=4; "4"=6 }
 $vCount = $resCountMap[$modeChoice]
 
-for ($i = 0; $i -lt $vCount; $i++) { New-Item -ItemType Directory -Path "v$i" -ErrorAction SilentlyContinue | Out-Null }
-for ($i = 0; $i -lt $totalAudioCount; $i++) { New-Item -ItemType Directory -Path "a$i" -ErrorAction SilentlyContinue | Out-Null }
-for ($i = 0; $i -lt $totalSubCount; $i++) { New-Item -ItemType Directory -Path "s$i" -ErrorAction SilentlyContinue | Out-Null }
+for ($i = 0; $i -lt $vCount; $i++) {
+    [System.IO.Directory]::CreateDirectory((Join-Path $outputDir "v$i")) | Out-Null
+}
+for ($i = 0; $i -lt $totalAudioCount; $i++) {
+    [System.IO.Directory]::CreateDirectory((Join-Path $outputDir "a$i")) | Out-Null
+}
+for ($i = 0; $i -lt $totalSubCount; $i++) {
+    [System.IO.Directory]::CreateDirectory((Join-Path $outputDir "s$i")) | Out-Null
+}
 
 Write-Host "✅ 根目录 AES 随机密钥与随机 IV (key.info) 初始化完成！" -ForegroundColor Green
 
@@ -211,18 +262,17 @@ if ($startConfirm -eq "Q" -or $startConfirm -eq "q") {
 # ------------------------------------------------------------------------------
 Write-Host "`n🚀 [阶段 1/2] 正在启动 FFmpeg 执行音视频加密切片...\n" -ForegroundColor Yellow
 
+# 强制追加 format=yuv420p 将 10-bit HDR 转为标准 8-bit YUV420P，防止 NVENC 报错
 function Get-PadFilter($w, $h) {
-    return "scale=w=${w}:h=${h}:force_original_aspect_ratio=decrease,pad=w='if(between(a,1.32,1.35),iw,${w})':h='if(between(a,1.32,1.35),ih,${h})':x='(ow-iw)/2':y='(oh-ih)/2'"
+    return "scale=w=${w}:h=${h}:force_original_aspect_ratio=decrease,pad=w='if(between(a,1.32,1.35),iw,${w})':h='if(between(a,1.32,1.35),ih,${h})':x='(ow-iw)/2':y='(oh-ih)/2',format=yuv420p"
 }
 
 $vcodec = if ($hasNvenc) { "h264_nvenc" } else { "libx264" }
 $preset = if ($hasNvenc) { "p4" } else { "fast" }
 
-# 1. 组装输入源
 $ffmpegInputs = @('-i', $inputFileFull)
 foreach ($aFile in $extAudioFiles) { $ffmpegInputs += @('-i', $aFile.FullName) }
 
-# 2. 组装分辨率与码率配置
 $vConfigs = @()
 switch ($modeChoice) {
     "1" { $vConfigs += @{ w=1920; h=1080; b="5000k"; max="5350k"; buf="7500k" } }
@@ -248,14 +298,14 @@ switch ($modeChoice) {
 }
 
 $splits = ($vConfigs.Count)
-$filterComplexParts = @("[0:v]split=$splits" + ((0..($splits-1)) | ForEach-Object { "[v$_]" }) -join "")
+$vAbsIndex = $videoStream.index
+$filterComplexParts = @("[0:$vAbsIndex]split=$splits" + ((0..($splits-1)) | ForEach-Object { "[v$_]" }) -join "")
 for ($i = 0; $i -lt $vConfigs.Count; $i++) {
     $cfg = $vConfigs[$i]
     $filterComplexParts += "[v$i]" + (Get-PadFilter $cfg.w $cfg.h) + "[v${i}out]"
 }
 $filterComplexStr = $filterComplexParts -join "; "
 
-# 3. 智能解析音频轨道并确定中文优先默认轨
 $allAudioTracksObj = @()
 for ($i = 0; $i -lt $embeddedAudio.Count; $i++) {
     $langObj = Parse-TrackLanguage -MetaLang $embeddedAudio[$i].tags.language -MetaTitle $embeddedAudio[$i].tags.title
@@ -279,7 +329,8 @@ for ($i = 0; $i -lt $vConfigs.Count; $i++) {
 
     $mapArgs += @(
         '-map', "[v${i}out]", "-c:v:$i", $vcodec, "-preset:v:$i", $preset,
-        "-b:v:$i", $cfg.b, "-maxrate:v:$i", $cfg.max, "-bufsize:v:$i", $cfg.buf
+        "-b:v:$i", $cfg.b, "-maxrate:v:$i", $cfg.max, "-bufsize:v:$i", $cfg.buf,
+        "-pix_fmt:v:$i", "yuv420p"
     )
 }
 
@@ -289,9 +340,9 @@ for ($i = 0; $i -lt $embeddedAudio.Count; $i++) {
     $isDefault = if ($zhAudioFound) { $track.Lang -eq "zh" } else { $aIdx -eq 0 }
     $defStr = if ($isDefault) { "YES" } else { "NO" }
     
-    # 规范化音轨目录名为 a0, a1 ...
+    $absIndex = $embeddedAudio[$i].index
     $varMapList += "a:$aIdx,agroup:audio_main,name:a$aIdx,language:$($track.Lang),default:$defStr"
-    $mapArgs += @('-map', "0:a:$i", "-c:a:$aIdx", 'aac', "-b:a:$aIdx", '128k')
+    $mapArgs += @('-map', "0:$absIndex", "-c:a:$aIdx", 'aac', "-b:a:$aIdx", '128k')
     $aIdx++
 }
 
@@ -301,7 +352,6 @@ foreach ($aFile in $extAudioFiles) {
     $isDefault = if ($zhAudioFound) { $track.Lang -eq "zh" } else { $aIdx -eq 0 }
     $defStr = if ($isDefault) { "YES" } else { "NO" }
     
-    # 规范化音轨目录名为 a0, a1 ...
     $varMapList += "a:$aIdx,agroup:audio_main,name:a$aIdx,language:$($track.Lang),default:$defStr"
     $mapArgs += @('-map', "${curAudioInputIdx}:a:0", "-c:a:$aIdx", 'aac', "-b:a:$aIdx", '128k')
     $aIdx++
@@ -310,7 +360,6 @@ foreach ($aFile in $extAudioFiles) {
 
 $varStreamMapStr = $varMapList -join " "
 
-# 4. 组装底层 GOP 强制锁定参数 (彻底消除 10 秒切片 Bug)
 $gopArgs = @(
     '-g', "$gop",
     '-keyint_min', "$gop",
@@ -323,7 +372,6 @@ if ($hasNvenc) {
     $gopArgs += @('-sc_threshold', '0')
 }
 
-# 5. 组装完整的 FFmpeg 命令行
 $ffmpegArgs = $ffmpegInputs + @('-filter_complex', $filterComplexStr) + $mapArgs + $gopArgs + @(
     '-f', 'hls', '-hls_time', '6', '-hls_playlist_type', 'vod',
     '-hls_key_info_file', 'key.info',
@@ -333,7 +381,6 @@ $ffmpegArgs = $ffmpegInputs + @('-filter_complex', $filterComplexStr) + $mapArgs
     '%v/prog_index.m3u8'
 )
 
-# 执行转码
 & ffmpeg $ffmpegArgs
 
 if ($LASTEXITCODE -ne 0) {
@@ -368,7 +415,8 @@ if ($totalSubCount -gt 0) {
         $subDir = Join-Path $outputDir "s$sIdx"
         $vttPath = Join-Path $subDir "sub.vtt"
 
-        & ffmpeg -hide_banner -loglevel error -y -i $inputFileFull -map "0:s:$i" $vttPath
+        $absSubIndex = $embeddedSubs[$i].index
+        & ffmpeg -hide_banner -loglevel error -y -i $inputFileFull -map "0:$absSubIndex" $vttPath
         
         $subM3u8Content = "#EXTM3U`n#EXT-X-VERSION:6`n#EXT-X-TARGETDURATION:7200`n#EXT-X-MEDIA-SEQUENCE:0`n#EXTINF:7200.000,`nsub.vtt`n#EXT-X-ENDLIST"
         [System.IO.File]::WriteAllText((Join-Path $subDir "prog_index.m3u8"), $subM3u8Content)
@@ -395,9 +443,9 @@ if ($totalSubCount -gt 0) {
     }
 }
 
-# 规范化重构 master.m3u8 (自动将标准化目录名 a0/a1 的显示名称重写为 中文/English)
+# 规范化重构 master.m3u8
 $masterPath = Join-Path $outputDir "master.m3u8"
-if (Test-Path $masterPath) {
+if ([System.IO.File]::Exists($masterPath)) {
     $masterLines = [System.IO.File]::ReadAllLines($masterPath)
     $newMaster = @()
 
@@ -413,7 +461,6 @@ if (Test-Path $masterPath) {
             continue
         }
 
-        # 将 FFmpeg 自动生成的 NAME="a0" / NAME="a1" 替换为真实识别的友好名称（如中文、English）
         if ($line -like "#EXT-X-MEDIA:TYPE=AUDIO*") {
             for ($k = 0; $k -lt $allAudioTracksObj.Count; $k++) {
                 $targetFolder = "a$k"
@@ -440,7 +487,7 @@ if (Test-Path $masterPath) {
 # 第七步：善后清理与成功提示
 # ------------------------------------------------------------------------------
 $tempKeyInfo = Join-Path $outputDir "key.info"
-if (Test-Path $tempKeyInfo) { Remove-Item -Path $tempKeyInfo -Force }
+if ([System.IO.File]::Exists($tempKeyInfo)) { Remove-Item -LiteralPath $tempKeyInfo -Force }
 
 Pop-Location
 
